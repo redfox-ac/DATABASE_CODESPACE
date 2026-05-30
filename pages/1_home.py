@@ -1,11 +1,13 @@
-import random
-
 import streamlit as st
+from google import genai
+from google.genai import errors
+from PIL import Image
+from pydantic import BaseModel, Field
 
 from utils.auth import require_login
 from utils.db import (
-    fetch_dictionary_ids,
     fetch_user,
+    fetch_all_dictionary,
     insert_discovery_transaction,
 )
 
@@ -19,6 +21,22 @@ if fresh:
     user = fresh
 
 
+class ImageAnalysisResult(BaseModel):
+    name: str = Field(description="동물의 한국어 생물종 이름")
+    confidence_score: float = Field(description="이 분석 결과에 대한 AI의 확신 점수 (0.0-1.0 사이)")
+
+
+if "GEMINI_API_KEY" in st.secrets:
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    config = genai.types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=ImageAnalysisResult,
+        temperature=0.1
+    )
+else:
+    st.error("GEMINI_API_KEY가 설정되지 않았습니다. st.secrets를 확인해주세요.")
+
+
 @st.dialog("📸 생물 수집 렌즈")
 def collection_lens():
     st.markdown("촬영한 생물 사진을 업로드해 주세요.")
@@ -30,29 +48,50 @@ def collection_lens():
     if uploaded is None:
         return
 
-    dict_ids = fetch_dictionary_ids()
-    if not dict_ids:
-        st.info("등록 가능한 도감 데이터가 없습니다.")
+    with st.status("분석 중...", expanded=True) as status:
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[Image.open(uploaded), "이 이미지를 정밀하게 분석해서 지정된 형식의 JSON 데이터로 출력해줘."],
+                config=config,
+            )
+            species_name = response.parsed.name.strip()
+            status.update(label="분석 완료!", state="complete", expanded=False)
+            st.write(species_name)
+            
+        except errors.ServerError as e:
+            st.error("현재 이용량이 많아 요청을 처리할 수 없습니다. 잠시 후 다시 시도해 주세요.")
+            return
+        except Exception as e:
+            st.error(f"분석 중 오류가 발생했습니다: {e}")
+            return
+    
+    dict_list = fetch_all_dictionary()
+    matched_entry = next((item for item in dict_list if item["name"].strip() == species_name), None)
+    
+    if matched_entry:
+        dictionary_id = matched_entry["id"]
+    else:
+        st.error(f"❌ '{species_name}'은(는) 에코퀘스트의 생물 목록에 등록되어 있지 않습니다.")
         return
 
-    chosen_id = random.choice(dict_ids)
-    result = insert_discovery_transaction(user["id"], chosen_id)
+    result = insert_discovery_transaction(user["id"], dictionary_id)
 
     if result is None:
+        st.error("생물 수집 데이터를 저장하는 데 실패했습니다.")
         return
+        
     if result.get("duplicate"):
-        st.info("이미 수집한 생물입니다.")
+        st.warning(f"이미 수집한 생물입니다: **{species_name}**")
         return
-
-    entry = result
-    name = entry.get("name", "알 수 없는 생물")
-    if entry.get("is_protected"):
+        
+    if result.get("is_protected"):
         st.warning(
-            f"⚠️ **{name}** — 법정 보호종으로 확인되었습니다. "
+            f"⚠️ **{species_name}** — 법정 보호종으로 확인되었습니다. "
             "관찰 기록만 저장되며, 채집·포획은 금지됩니다. (+10 XP)"
         )
     else:
-        st.success(f"🎉 **{name}** 수집 완료! (+10 XP)")
+        st.success(f"🎉 **{species_name}** 수집 완료! (+10 XP)")
 
     updated = fetch_user(user["id"], nickname=user.get("nickname", ""))
     if updated:
