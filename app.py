@@ -1,71 +1,55 @@
-from sqlalchemy import text
 import streamlit as st
-import pandas as pd
 
-st.set_page_config(page_title="Supabase 연결 테스트", page_icon="🗄️")
-st.title("Supabase DB 연결 테스트")
+from utils.auth import init_session, render_sidebar_nav
+from utils.db import authenticate_user
 
-conn = st.connection("supabase_db", type="sql")
+st.set_page_config(page_title="EcoQuest", layout="wide")
+init_session()
 
-st.subheader("1. 연결 확인")
+if st.session_state.logged_in and st.session_state.user_info:
+    render_sidebar_nav()
 
-try:
-    result = conn.query("SELECT current_database() AS db_name, now() AS server_time;")
-    st.success("DB 연결 성공")
-    st.dataframe(result)
-except Exception as e:
-    st.error(f"DB 연결 실패: {e}")
-    st.stop()
+    st.title("🌿 EcoQuest")
+    st.markdown(
+        """
+        사이드바에서 메뉴를 선택해 탐험을 시작하세요.
 
-st.subheader("2. 테스트 테이블 생성")
+        - **홈**: 프로필과 생물 수집 렌즈
+        - **도감**: 수집한 생물 카드
+        - **퀘스트**: 일일·연구 퀘스트 보드
+        - **테라리움**: 나만의 생태 환경
+        - **미니게임**: 데이터 신뢰성 검증 (캡차)
+        """
+    )
+else:
+    st.title("🌿 EcoQuest")
+    st.caption("닉네임으로 로그인하고 생태 탐험을 시작하세요.")
 
-try:
-    with conn.session as s:
-        s.execute(text("""
-            CREATE TABLE IF NOT EXISTS streamlit_test (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-        """))
-        s.commit()
-    st.success("테이블 확인/생성 완료")
-except Exception as e:
-    st.error(f"테이블 생성 실패: {e}")
-    st.stop()
-
-st.subheader("3. 데이터 입력")
-
-name = st.text_input("이름 입력", placeholder="예: Gil-Dong")
-
-if st.button("저장"):
-    if not name.strip():
-        st.warning("이름을 입력해줘.")
-    else:
-        try:
-            with conn.session as s:
-                s.execute(
-                    text("INSERT INTO streamlit_test (name) VALUES (:name)"),
-                    {"name": name.strip()}
-                )
-                s.commit()
-            st.success("저장 완료")
-            st.rerun()
-        except Exception as e:
-            st.error(f"저장 실패: {e}")
-
-st.subheader("4. 저장된 데이터 조회")
-
-try:
-    df = conn.query("""
-        SELECT id, name, created_at
-        FROM streamlit_test
-        ORDER BY id DESC;
-    """, ttl=0)
-
-    if df.empty:
-        st.info("아직 저장된 데이터가 없습니다.")
-    else:
-        st.dataframe(df, use_container_width=True)
-except Exception as e:
-    st.error(f"조회 실패: {e}")
+    _, center, _ = st.columns([1, 1.2, 1])
+    with center:
+        st.markdown(
+            """
+            <div style="
+                border: 1px solid #2d6a4f;
+                border-radius: 12px;
+                padding: 2rem 1.5rem;
+                background: linear-gradient(145deg, #1b4332 0%, #081c15 100%);
+                box-shadow: 0 4px 24px rgba(0,0,0,0.25);
+            ">
+            <h3 style="text-align:center; margin-top:0; color:#95d5b2;">🔐 탐험가 로그인</h3>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.form("login_form", clear_on_submit=False):
+            nickname = st.text_input("닉네임", placeholder="예: eco_explorer")
+            submitted = st.form_submit_button("로그인", type="primary", width="stretch")
+            if submitted:
+                if not nickname.strip():
+                    st.warning("닉네임을 입력해 주세요.")
+                else:
+                    user = authenticate_user(nickname)
+                    if user:
+                        st.session_state.logged_in = True
+                        st.session_state.user_info = user
+                        st.rerun()
