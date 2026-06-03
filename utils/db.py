@@ -219,22 +219,27 @@ def fetch_quests() -> list[dict]:
         return []
 
 
-def fetch_terrarium_slots(user_id) -> list[dict]:
+def fetch_terrarium_layout(user_id) -> list[dict]:
+    """모든 슬롯 정의와 유저 장착 상태를 합쳐 반환합니다."""
     try:
         with psycopg.connect(_db_url()) as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     """
                     SELECT
-                        ts.id,
-                        ut.user_id,
-                        ts.name,
-                        COALESCE(ic.name, '') AS equipped_category
-                    FROM user_terrarium ut
-                    JOIN terrarium_slot ts ON ts.id = ut.slot_id
+                        ts.id AS slot_id,
+                        ts.name AS slot_name,
+                        ts.description AS slot_description,
+                        ts.category_id AS slot_category_id,
+                        ic_slot.name AS slot_category_name,
+                        ut.item_id AS equipped_item_id,
+                        i.name AS equipped_item_name
+                    FROM terrarium_slot ts
+                    LEFT JOIN items_category ic_slot
+                        ON ic_slot.id = ts.category_id
+                    LEFT JOIN user_terrarium ut
+                        ON ut.slot_id = ts.id AND ut.user_id = %s
                     LEFT JOIN items i ON i.id = ut.item_id
-                    LEFT JOIN items_category ic ON ic.id = i.category_id
-                    WHERE ut.user_id = %s
                     ORDER BY ts.id
                     """,
                     (user_id,),
@@ -243,3 +248,94 @@ def fetch_terrarium_slots(user_id) -> list[dict]:
     except Exception:
         st.warning("테라리움 슬롯 데이터를 불러오는 데 실패했습니다.")
         return []
+
+
+def fetch_user_inventory(user_id) -> list[dict]:
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        ui.id AS inventory_id,
+                        ui.item_id,
+                        ui.quantity,
+                        i.name AS item_name,
+                        i.category_id,
+                        ic.name AS category_name
+                    FROM user_inventory ui
+                    JOIN items i ON i.id = ui.item_id
+                    LEFT JOIN items_category ic ON ic.id = i.category_id
+                    WHERE ui.user_id = %s AND ui.quantity > 0
+                    ORDER BY ic.name NULLS LAST, i.name
+                    """,
+                    (user_id,),
+                )
+                return [dict(row) for row in cur.fetchall()]
+    except Exception:
+        st.warning("인벤토리를 불러오는 데 실패했습니다.")
+        return []
+
+
+def equip_terrarium_item(user_id, slot_id: int, item_id: int) -> str | None:
+    """슬롯에 아이템을 장착합니다. 성공 시 None, 실패 시 오류 메시지."""
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT category_id FROM terrarium_slot WHERE id = %s
+                    """,
+                    (slot_id,),
+                )
+                slot = cur.fetchone()
+                if not slot:
+                    return "존재하지 않는 슬롯입니다."
+
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM user_inventory ui
+                    JOIN items i ON i.id = ui.item_id
+                    WHERE ui.user_id = %s
+                      AND ui.item_id = %s
+                      AND ui.quantity > 0
+                      AND i.category_id = %s
+                    """,
+                    (user_id, item_id, slot["category_id"]),
+                )
+                if not cur.fetchone():
+                    return "인벤토리에 없거나 이 슬롯에 맞지 않는 아이템입니다."
+
+                cur.execute(
+                    """
+                    INSERT INTO user_terrarium (user_id, slot_id, item_id)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id, slot_id)
+                    DO UPDATE SET item_id = EXCLUDED.item_id
+                    """,
+                    (user_id, slot_id, item_id),
+                )
+                conn.commit()
+                return None
+    except Exception:
+        st.error("아이템 장착에 실패했습니다.")
+        return "아이템 장착에 실패했습니다."
+
+
+def unequip_terrarium_item(user_id, slot_id: int) -> str | None:
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM user_terrarium
+                    WHERE user_id = %s AND slot_id = %s
+                    """,
+                    (user_id, slot_id),
+                )
+                conn.commit()
+                return None
+    except Exception:
+        st.error("아이템 해제에 실패했습니다.")
+        return "아이템 해제에 실패했습니다."
