@@ -179,10 +179,89 @@ def insert_discovery_transaction(user_id, dictionary_id: int) -> dict | None:
                     """,
                     (user_id, _DEMO_STORAGE_URL, dictionary_id),
                 )
+
+                # Get category_id of this dictionary entry
+                cur.execute(
+                    "SELECT category_id FROM dictionary WHERE id = %s",
+                    (dictionary_id,),
+                )
+                dict_entry = cur.fetchone()
+                category_id = dict_entry["category_id"] if dict_entry else None
+
+                # Update quest progress for active quests
+                # Update specific species progress
+                cur.execute(
+                    """
+                    UPDATE quest_progress_dictionary
+                    SET current_count = current_count + 1
+                    WHERE user_id = %s AND dictionary_id = %s
+                      AND quest_id IN (
+                          SELECT quest_id FROM user_quest WHERE user_id = %s AND status = 'in_progress'
+                      )
+                    """,
+                    (user_id, dictionary_id, user_id),
+                )
+
+                # Update category progress
+                if category_id is not None:
+                    cur.execute(
+                        """
+                        UPDATE quest_progress_dictionary_categories
+                        SET current_count = current_count + 1
+                        WHERE user_id = %s AND category_id = %s
+                          AND quest_id IN (
+                              SELECT quest_id FROM user_quest WHERE user_id = %s AND status = 'in_progress'
+                          )
+                        """,
+                        (user_id, category_id, user_id),
+                    )
+
+                # Check if any active quests are now completed
+                cur.execute(
+                    """
+                    SELECT uq.quest_id
+                    FROM user_quest uq
+                    WHERE uq.user_id = %s AND uq.status = 'in_progress'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM target_dictionary td
+                          LEFT JOIN quest_progress_dictionary qpd
+                            ON qpd.user_id = uq.user_id
+                           AND qpd.quest_id = uq.quest_id
+                           AND qpd.dictionary_id = td.dictionary_id
+                          WHERE td.quest_id = uq.quest_id
+                            AND COALESCE(qpd.current_count, 0) < td.target_count
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM target_dictionary_categories tdc
+                          LEFT JOIN quest_progress_dictionary_categories qpdc
+                            ON qpdc.user_id = uq.user_id
+                           AND qpdc.quest_id = uq.quest_id
+                           AND qpdc.category_id = tdc.category_id
+                          WHERE tdc.quest_id = uq.quest_id
+                            AND COALESCE(qpdc.current_count, 0) < tdc.target_count
+                      )
+                    """,
+                    (user_id,),
+                )
+                completed_quests = [r["quest_id"] for r in cur.fetchall()]
+
+                for q_id in completed_quests:
+                    cur.execute(
+                        """
+                        UPDATE user_quest
+                        SET status = 'completed'
+                        WHERE user_id = %s AND quest_id = %s
+                        """,
+                        (user_id, q_id),
+                    )
+
                 cur.execute(
                     "UPDATE users SET xp = xp + 10 WHERE id = %s",
                     (user_id,),
                 )
+
                 cur.execute(
                     """
                     SELECT id, name, description, is_protected, category_id,
@@ -197,8 +276,8 @@ def insert_discovery_transaction(user_id, dictionary_id: int) -> dict | None:
                 if entry:
                     return dict(entry)
                 return None
-    except Exception:
-        st.error("생물 수집을 저장하는 데 실패했습니다.")
+    except Exception as e:
+        st.error(f"생물 수집을 저장하는 데 실패했습니다: {e}")
         return None
 
 
@@ -339,3 +418,277 @@ def unequip_terrarium_item(user_id, slot_id: int) -> str | None:
     except Exception:
         st.error("아이템 해제에 실패했습니다.")
         return "아이템 해제에 실패했습니다."
+
+
+def fetch_available_quests(user_id) -> list[dict]:
+    """유저가 수락하지 않은 퀘스트 목록을 목표 및 보상 정보와 함께 조회합니다."""
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # 1. Fetch quests not accepted by the user
+                cur.execute(
+                    """
+                    SELECT q.id, q.description, q.reward_xp
+                    FROM quest q
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM user_quest uq
+                        WHERE uq.quest_id = q.id AND uq.user_id = %s
+                    )
+                    ORDER BY q.id
+                    """,
+                    (user_id,),
+                )
+                quests = [dict(row) for row in cur.fetchall()]
+
+                # 2. For each quest, get its targets and rewards
+                for q in quests:
+                    q_id = q["id"]
+                    
+                    # Fetch species targets
+                    cur.execute(
+                        """
+                        SELECT td.dictionary_id, td.target_count, d.name AS species_name
+                        FROM target_dictionary td
+                        JOIN dictionary d ON d.id = td.dictionary_id
+                        WHERE td.quest_id = %s
+                        """,
+                        (q_id,),
+                    )
+                    q["target_species"] = [dict(r) for r in cur.fetchall()]
+
+                    # Fetch category targets
+                    cur.execute(
+                        """
+                        SELECT tdc.category_id, tdc.target_count, c.name AS category_name
+                        FROM target_dictionary_categories tdc
+                        JOIN dictionary_categories c ON c.id = tdc.category_id
+                        WHERE tdc.quest_id = %s
+                        """,
+                        (q_id,),
+                    )
+                    q["target_categories"] = [dict(r) for r in cur.fetchall()]
+
+                    # Fetch items rewards
+                    cur.execute(
+                        """
+                        SELECT qr.item_id, qr.amount, i.name AS item_name
+                        FROM quest_reward qr
+                        JOIN items i ON i.id = qr.item_id
+                        WHERE qr.quest_id = %s
+                        """,
+                        (q_id,),
+                    )
+                    q["rewards"] = [dict(r) for r in cur.fetchall()]
+
+                return quests
+    except Exception:
+        st.warning("수락 가능한 퀘스트 목록을 불러오는 데 실패했습니다.")
+        return []
+
+
+def accept_quest(user_id, quest_id: int) -> bool:
+    """퀘스트를 수락하여 user_quest 및 진행도 추적 테이블(quest_progress~)에 초기 데이터를 삽입합니다."""
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor() as cur:
+                # 1. Insert user_quest row
+                cur.execute(
+                    """
+                    INSERT INTO user_quest (user_id, quest_id, status)
+                    VALUES (%s, %s, 'in_progress')
+                    ON CONFLICT (user_id, quest_id) DO NOTHING
+                    """,
+                    (user_id, quest_id),
+                )
+                
+                # 2. Insert target_dictionary targets into progress with count = 0
+                cur.execute(
+                    """
+                    INSERT INTO quest_progress_dictionary (user_id, quest_id, dictionary_id, current_count)
+                    SELECT %s, %s, dictionary_id, 0
+                    FROM target_dictionary
+                    WHERE quest_id = %s
+                    ON CONFLICT (user_id, quest_id, dictionary_id) DO NOTHING
+                    """,
+                    (user_id, quest_id, quest_id),
+                )
+
+                # 3. Insert target_dictionary_categories targets into progress with count = 0
+                cur.execute(
+                    """
+                    INSERT INTO quest_progress_dictionary_categories (user_id, quest_id, category_id, current_count)
+                    SELECT %s, %s, category_id, 0
+                    FROM target_dictionary_categories
+                    WHERE quest_id = %s
+                    ON CONFLICT (user_id, quest_id, category_id) DO NOTHING
+                    """,
+                    (user_id, quest_id, quest_id),
+                )
+                
+                conn.commit()
+                return True
+    except Exception as e:
+        st.error(f"퀘스트 수락에 실패했습니다: {e}")
+        return False
+
+
+def fetch_user_quests(user_id) -> list[dict]:
+    """유저가 수락한 퀘스트(진행 중, 완료, 수령 완료) 목록을 진행 상황 및 보상 정보와 함께 가져옵니다."""
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Fetch user quests
+                cur.execute(
+                    """
+                    SELECT uq.quest_id, uq.status, uq.assigned_at, q.description, q.reward_xp
+                    FROM user_quest uq
+                    JOIN quest q ON q.id = uq.quest_id
+                    WHERE uq.user_id = %s
+                    ORDER BY uq.assigned_at DESC, uq.quest_id
+                    """,
+                    (user_id,),
+                )
+                user_quests = [dict(row) for row in cur.fetchall()]
+
+                for uq in user_quests:
+                    q_id = uq["quest_id"]
+
+                    # Fetch species targets with current progress count
+                    cur.execute(
+                        """
+                        SELECT td.dictionary_id, td.target_count, d.name AS species_name,
+                               COALESCE(qpd.current_count, 0) AS current_count
+                        FROM target_dictionary td
+                        JOIN dictionary d ON d.id = td.dictionary_id
+                        LEFT JOIN quest_progress_dictionary qpd
+                          ON qpd.user_id = %s
+                         AND qpd.quest_id = td.quest_id
+                         AND qpd.dictionary_id = td.dictionary_id
+                        WHERE td.quest_id = %s
+                        """,
+                        (user_id, q_id),
+                    )
+                    uq["target_species"] = [dict(r) for r in cur.fetchall()]
+
+                    # Fetch category targets with current progress count
+                    cur.execute(
+                        """
+                        SELECT tdc.category_id, tdc.target_count, c.name AS category_name,
+                               COALESCE(qpdc.current_count, 0) AS current_count
+                        FROM target_dictionary_categories tdc
+                        JOIN dictionary_categories c ON c.id = tdc.category_id
+                        LEFT JOIN quest_progress_dictionary_categories qpdc
+                          ON qpdc.user_id = %s
+                         AND qpdc.quest_id = tdc.quest_id
+                         AND qpdc.category_id = tdc.category_id
+                        WHERE tdc.quest_id = %s
+                        """,
+                        (user_id, q_id),
+                    )
+                    uq["target_categories"] = [dict(r) for r in cur.fetchall()]
+
+                    # Fetch items rewards
+                    cur.execute(
+                        """
+                        SELECT qr.item_id, qr.amount, i.name AS item_name
+                        FROM quest_reward qr
+                        JOIN items i ON i.id = qr.item_id
+                        WHERE qr.quest_id = %s
+                        """,
+                        (q_id,),
+                    )
+                    uq["rewards"] = [dict(r) for r in cur.fetchall()]
+
+                return user_quests
+    except Exception:
+        st.warning("유저 퀘스트 목록을 불러오는 데 실패했습니다.")
+        return []
+
+
+def claim_quest_reward(user_id, quest_id: int) -> dict | None:
+    """퀘스트 보상을 지급하고 user_quest 상태를 'claimed'로 업데이트합니다. 획득 보상 반환."""
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # 1. Verify quest state
+                cur.execute(
+                    """
+                    SELECT status FROM user_quest
+                    WHERE user_id = %s AND quest_id = %s
+                    """,
+                    (user_id, quest_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"success": False, "message": "수락되지 않은 퀘스트입니다."}
+                if row["status"] != "completed":
+                    if row["status"] == "claimed":
+                        return {"success": False, "message": "이미 보상을 수령한 퀘스트입니다."}
+                    return {"success": False, "message": "아직 완료되지 않은 퀘스트입니다."}
+
+                # 2. Get quest reward details
+                cur.execute(
+                    """
+                    SELECT id, description, reward_xp FROM quest WHERE id = %s
+                    """,
+                    (quest_id,),
+                )
+                quest = cur.fetchone()
+                if not quest:
+                    return {"success": False, "message": "존재하지 않는 퀘스트입니다."}
+
+                cur.execute(
+                    """
+                    SELECT qr.item_id, qr.amount, i.name AS item_name
+                    FROM quest_reward qr
+                    JOIN items i ON i.id = qr.item_id
+                    WHERE qr.quest_id = %s
+                    """,
+                    (quest_id,),
+                )
+                rewards = [dict(r) for r in cur.fetchall()]
+
+                # 3. Apply XP reward
+                reward_xp = quest.get("reward_xp", 0)
+                cur.execute(
+                    "UPDATE users SET xp = xp + %s WHERE id = %s",
+                    (reward_xp, user_id),
+                )
+
+                # 4. Apply Item rewards
+                acquired_items = []
+                for reward in rewards:
+                    item_id = reward["item_id"]
+                    amount = reward["amount"]
+                    cur.execute(
+                        """
+                        INSERT INTO user_inventory (user_id, item_id, quantity)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (user_id, item_id)
+                        DO UPDATE SET quantity = user_inventory.quantity + EXCLUDED.quantity
+                        """,
+                        (user_id, item_id, amount),
+                    )
+                    acquired_items.append(f"{reward['item_name']} {amount}개")
+
+                # 5. Set user_quest status to 'claimed'
+                cur.execute(
+                    """
+                    UPDATE user_quest
+                    SET status = 'claimed'
+                    WHERE user_id = %s AND quest_id = %s
+                    """,
+                    (user_id, quest_id),
+                )
+
+                conn.commit()
+                return {
+                    "success": True,
+                    "reward_xp": reward_xp,
+                    "items": acquired_items,
+                    "message": "보상 수령 완료!"
+                }
+    except Exception as e:
+        st.error(f"보상 수령 처리 중 오류가 발생했습니다: {e}")
+        return {"success": False, "message": "보상 수령 처리 중 오류가 발생했습니다."}
+
