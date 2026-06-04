@@ -95,6 +95,7 @@ Gemini 대화: https://gemini.google.com/share/77642d9babf6
 | `id`          | 퀘스트 마스터 고유 번호 |
 | `description` | 퀘스트 내용 및 설명   |
 | `reward_xp`   | 보상으로 주어지는 경험치 |
+| `expire_at`   | 퀘스트 만료 일시 |
 
 - **QuestReward**: 퀘스트 보상 정보
 
@@ -127,7 +128,6 @@ Gemini 대화: https://gemini.google.com/share/77642d9babf6
 | `user_id`     | 퀘스트를 수행하는 유저 ID                               |
 | `quest_id`    | 수행 중인 퀘스트 마스터 ID                              |
 | `status`      | 진행 상태 ('in_progress', 'completed', 'expired') |
-| `assigned_at` | 퀘스트 발급 일시                                     |
 
 - **QuestProgressDictionary**: 유저의 퀘스트 상세 진행 정보 (생물종)
 
@@ -240,7 +240,8 @@ CREATE TABLE user_terrarium (
 CREATE TABLE quest (
     id SERIAL PRIMARY KEY,
     description TEXT NOT NULL,
-    reward_xp INT DEFAULT 0
+    reward_xp INT DEFAULT 0,
+    expire_at TIMESTAMP WITH TIME ZONE DEFAULT date_trunc('day'::text, (now() + '2 days'::interval))
 );
 
 CREATE TABLE quest_reward (
@@ -268,7 +269,6 @@ CREATE TABLE user_quest (
     user_id UUID REFERENCES users(id),
     quest_id INT REFERENCES quest(id),
     status VARCHAR(20) DEFAULT 'in_progress',
-    assigned_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     PRIMARY KEY (user_id, quest_id)
 );
 
