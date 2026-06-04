@@ -3,6 +3,7 @@ import uuid
 import psycopg
 import streamlit as st
 from psycopg.rows import dict_row
+from supabase import create_client
 
 DEFAULT_MAX_XP = 200
 _DEMO_STORAGE_URL = "demo://ecoquest/collection"
@@ -10,6 +11,20 @@ _DEMO_STORAGE_URL = "demo://ecoquest/collection"
 
 def _db_url() -> str:
     return st.secrets["SUPABASE_DB_URL"]
+
+
+def upload_picture_to_supabase(file_data: bytes, file_name: str) -> str:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    client = create_client(url, key)
+    
+    client.storage.from_("picture").upload(
+        file=file_data,
+        path=file_name,
+        file_options={"content-type": "image/jpeg"}
+    )
+    
+    return file_name
 
 
 def nickname_to_user_id(nickname: str) -> uuid.UUID:
@@ -93,7 +108,7 @@ def fetch_user_collection(user_id) -> list[dict]:
                         d.description,
                         d.is_protected,
                         d.category_id,
-                        NULL::text AS image_url
+                        p.storage_url AS image_url
                     FROM pictures p
                     JOIN dictionary d
                         ON d.id = COALESCE(p.confirmed_dictionary_id, p.candidate_dictionary_id)
@@ -103,7 +118,21 @@ def fetch_user_collection(user_id) -> list[dict]:
                     """,
                     (user_id,),
                 )
-                return [dict(row) for row in cur.fetchall()]
+                rows = [dict(row) for row in cur.fetchall()]
+                
+                if rows:
+                    url = st.secrets["SUPABASE_URL"]
+                    key = st.secrets["SUPABASE_KEY"]
+                    client = create_client(url, key)
+                    for r in rows:
+                        path = r.get("image_url")
+                        if path and not path.startswith("http") and not path.startswith("demo://"):
+                            try:
+                                signed_res = client.storage.from_("picture").create_signed_url(path, expires_in=604800)
+                                r["image_url"] = signed_res["signedURL"]
+                            except Exception as e:
+                                print(f"Error generating signed URL for {path}: {e}")
+                return rows
     except Exception:
         st.warning("수집 도감 데이터를 불러오는 데 실패했습니다.")
         return []
@@ -158,7 +187,7 @@ def fetch_all_dictionary() -> list[dict]:
         return []
 
 
-def insert_discovery_transaction(user_id, dictionary_id: int) -> dict | None:
+def insert_discovery_transaction(user_id, dictionary_id: int, storage_url: str = _DEMO_STORAGE_URL) -> dict | None:
     try:
         with psycopg.connect(_db_url()) as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -177,7 +206,7 @@ def insert_discovery_transaction(user_id, dictionary_id: int) -> dict | None:
                     INSERT INTO pictures (user_id, storage_url, candidate_dictionary_id)
                     VALUES (%s, %s, %s)
                     """,
-                    (user_id, _DEMO_STORAGE_URL, dictionary_id),
+                    (user_id, storage_url, dictionary_id),
                 )
 
                 # Get category_id of this dictionary entry

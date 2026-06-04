@@ -8,3 +8,4 @@ lib/
 etc/
 bin
 pyvenv.cfg
+pyproject.toml

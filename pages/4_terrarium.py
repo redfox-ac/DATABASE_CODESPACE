@@ -106,10 +106,12 @@ with left:
             format_func=lambda sid: slot_labels[sid],
             key="terrarium_slot_picker",
         )
+        # pyrefly: ignore [bad-argument-type]
         selected = _slot_by_id(selected_id)
         if selected and selected.get("slot_description"):
             st.markdown(selected["slot_description"])
         if st.button("선택한 슬롯 꾸미기", type="primary", use_container_width=True):
+            # pyrefly: ignore [bad-argument-type]
             slot_editor(selected_id)
 
     st.divider()

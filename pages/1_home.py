@@ -1,3 +1,6 @@
+import io
+import time
+import uuid
 import streamlit as st
 from google import genai
 from google.genai import errors
@@ -9,6 +12,7 @@ from utils.db import (
     fetch_user,
     fetch_all_dictionary,
     insert_discovery_transaction,
+    upload_picture_to_supabase,
 )
 
 st.set_page_config(page_title="홈 · EcoQuest", layout="wide")
@@ -19,6 +23,41 @@ fresh = fetch_user(user["id"], nickname=user.get("nickname", ""))
 if fresh:
     st.session_state.user_info = fresh
     user = fresh
+
+
+def compress_image(uploaded_file, max_size_bytes=2 * 1024 * 1024) -> io.BytesIO:
+    img = Image.open(uploaded_file)
+    
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+        
+    quality = 90
+    output = io.BytesIO()
+    img.save(output, format="JPEG", quality=quality)
+    
+    if len(output.getvalue()) <= max_size_bytes:
+        output.seek(0)
+        return output
+        
+    width, height = img.size
+    for attempt in range(10):
+        for q in [85, 80, 75, 70]:
+            output = io.BytesIO()
+            img.save(output, format="JPEG", quality=q)
+            if len(output.getvalue()) <= max_size_bytes:
+                output.seek(0)
+                return output
+        
+        width = int(width * 0.8)
+        height = int(height * 0.8)
+        if width < 800 or height < 800:
+            break
+        img = img.resize((width, height), Image.Resampling.LANCZOS)
+        
+    output = io.BytesIO()
+    img.save(output, format="JPEG", quality=60)
+    output.seek(0)
+    return output
 
 
 class ImageAnalysisResult(BaseModel):
@@ -50,37 +89,53 @@ def collection_lens():
 
     with st.status("분석 중...", expanded=True) as status:
         try:
+            status.update(label="이미지 변환 및 압축 중...")
+            compressed_io = compress_image(uploaded)
+            compressed_bytes = compressed_io.getvalue()
+            
+            status.update(label="AI 분석 중...")
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
-                contents=[Image.open(uploaded), "이 이미지를 정밀하게 분석해서 지정된 형식의 JSON 데이터로 출력해줘."],
+                # pyrefly: ignore [bad-argument-type]
+                contents=[Image.open(io.BytesIO(compressed_bytes)), "이 이미지를 정밀하게 분석해서 지정된 형식의 JSON 데이터로 출력해줘."],
                 config=config,
             )
+            # pyrefly: ignore [missing-attribute]
             species_name = response.parsed.name.strip()
-            status.update(label="분석 완료!", state="complete", expanded=False)
-            st.write(species_name)
+            
+            dict_list = fetch_all_dictionary()
+            matched_entry = next((item for item in dict_list if item["name"].strip() == species_name), None)
+            
+            if matched_entry is None:
+                status.update(label="분석 실패", state="error")
+                st.error(f"❌ '{species_name}'은(는) 에코퀘스트의 생물 목록에 등록되어 있지 않습니다.")
+                return
+                
+            dictionary_id = matched_entry["id"]
+            
+            status.update(label="이미지 업로드 중...")
+            file_name = f"{user['id']}_{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"
+            public_url = upload_picture_to_supabase(compressed_bytes, file_name)
+            
+            status.update(label="데이터 저장 중...")
+            result = insert_discovery_transaction(user["id"], dictionary_id, public_url)
+            
+            if result is None:
+                status.update(label="저장 실패", state="error")
+                st.error("생물 수집 데이터를 저장하는 데 실패했습니다.")
+                return
+                
+            status.update(label="분석 완료 및 저장 완료!", state="complete", expanded=False)
             
         except errors.ServerError as e:
+            status.update(label="분석 실패", state="error")
             st.error("현재 이용량이 많아 요청을 처리할 수 없습니다. 잠시 후 다시 시도해 주세요.")
             return
         except Exception as e:
+            status.update(label="분석 중 오류 발생", state="error")
             st.error(f"분석 중 오류가 발생했습니다: {e}")
             return
-    
-    dict_list = fetch_all_dictionary()
-    matched_entry = next((item for item in dict_list if item["name"].strip() == species_name), None)
-    
-    if matched_entry:
-        dictionary_id = matched_entry["id"]
-    else:
-        st.error(f"❌ '{species_name}'은(는) 에코퀘스트의 생물 목록에 등록되어 있지 않습니다.")
-        return
-
-    result = insert_discovery_transaction(user["id"], dictionary_id)
-
-    if result is None:
-        st.error("생물 수집 데이터를 저장하는 데 실패했습니다.")
-        return
-        
+            
     if result.get("duplicate"):
         st.warning(f"이미 수집한 생물입니다: **{species_name}**")
         return
