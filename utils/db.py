@@ -721,3 +721,105 @@ def claim_quest_reward(user_id, quest_id: int) -> dict | None:
         st.error(f"보상 수령 처리 중 오류가 발생했습니다: {e}")
         return {"success": False, "message": "보상 수령 처리 중 오류가 발생했습니다."}
 
+
+def fetch_all_categories() -> list[dict]:
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT id, name, description FROM dictionary_categories ORDER BY name")
+                return [dict(row) for row in cur.fetchall()]
+    except Exception:
+        st.warning("분류 목록을 불러오는 데 실패했습니다.")
+        return []
+
+
+def fetch_paged_dictionary_with_discovery(
+    user_id,
+    # pyrefly: ignore [bad-function-definition]
+    search_query: str = None,
+    # pyrefly: ignore [bad-function-definition]
+    category_id: int = None,
+    discovery_filter: str = "전체",  # "전체", "발견 완료", "미발견"
+    limit: int = 24,
+    offset: int = 0
+) -> tuple[list[dict], int]:
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                conditions = []
+                params = [user_id]
+                
+                if search_query and search_query.strip():
+                    conditions.append("d.name ILIKE %s")
+                    params.append(f"%{search_query.strip()}%")
+                    
+                if category_id is not None:
+                    conditions.append("d.category_id = %s")
+                    params.append(category_id)
+                    
+                if discovery_filter == "발견 완료":
+                    conditions.append("p.id IS NOT NULL")
+                elif discovery_filter == "미발견":
+                    conditions.append("p.id IS NULL")
+                    
+                where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+                
+                # Get total count
+                count_query = f"""
+                    SELECT COUNT(DISTINCT d.id) 
+                    FROM dictionary d
+                    LEFT JOIN pictures p
+                        ON p.user_id = %s
+                       AND COALESCE(p.confirmed_dictionary_id, p.candidate_dictionary_id) = d.id
+                    {where_clause}
+                """
+                # pyrefly: ignore [bad-argument-type]
+                cur.execute(count_query, params)
+                row = cur.fetchone()
+                total_count = list(row.values())[0] if row else 0
+                
+                # Get paged data
+                data_query = f"""
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (d.id)
+                            d.id AS dictionary_id,
+                            d.name,
+                            d.description,
+                            d.is_protected,
+                            d.category_id,
+                            p.storage_url AS image_url,
+                            d.name AS sort_name
+                        FROM dictionary d
+                        LEFT JOIN pictures p
+                            ON p.user_id = %s
+                           AND COALESCE(p.confirmed_dictionary_id, p.candidate_dictionary_id) = d.id
+                        {where_clause}
+                        ORDER BY d.id, p.id DESC
+                    ) sub
+                    ORDER BY sort_name ASC
+                    LIMIT %s OFFSET %s
+                """
+                
+                data_params = params + [limit, offset]
+                # pyrefly: ignore [bad-argument-type]
+                cur.execute(data_query, data_params)
+                rows = [dict(row) for row in cur.fetchall()]
+                
+                if rows:
+                    url = st.secrets["SUPABASE_URL"]
+                    key = st.secrets["SUPABASE_KEY"]
+                    client = create_client(url, key)
+                    for r in rows:
+                        path = r.get("image_url")
+                        if path and not path.startswith("http") and not path.startswith("demo://"):
+                            try:
+                                signed_res = client.storage.from_("picture").create_signed_url(path, expires_in=604800)
+                                r["image_url"] = signed_res["signedURL"]
+                            except Exception as e:
+                                print(f"Error generating signed URL for {path}: {e}")
+                                
+                return rows, total_count
+    except Exception as e:
+        st.warning(f"도감 데이터를 불러오는 데 실패했습니다: {e}")
+        return [], 0
+
