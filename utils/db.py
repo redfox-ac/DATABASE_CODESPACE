@@ -569,11 +569,11 @@ def fetch_user_quests(user_id) -> list[dict]:
                 # Fetch user quests
                 cur.execute(
                     """
-                    SELECT uq.quest_id, uq.status, uq.assigned_at, q.description, q.reward_xp
+                    SELECT uq.quest_id, uq.status, q.description, q.reward_xp, q.expire_at
                     FROM user_quest uq
                     JOIN quest q ON q.id = uq.quest_id
                     WHERE uq.user_id = %s
-                    ORDER BY uq.assigned_at DESC, uq.quest_id
+                    ORDER BY q.expire_at ASC, uq.quest_id DESC
                     """,
                     (user_id,),
                 )
@@ -822,4 +822,51 @@ def fetch_paged_dictionary_with_discovery(
     except Exception as e:
         st.warning(f"도감 데이터를 불러오는 데 실패했습니다: {e}")
         return [], 0
+
+
+def cleanup_expired_quests() -> None:
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor() as cur:
+                # 1. Get expired quest IDs
+                cur.execute("SELECT id FROM quest WHERE expire_at < NOW()")
+                expired_ids = [row[0] for row in cur.fetchall()]
+                
+                if expired_ids:
+                    # 2. Delete progress details first due to foreign key constraints (NO ACTION)
+                    cur.execute(
+                        "DELETE FROM quest_progress_dictionary WHERE quest_id = ANY(%s)",
+                        (expired_ids,),
+                    )
+                    cur.execute(
+                        "DELETE FROM quest_progress_dictionary_categories WHERE quest_id = ANY(%s)",
+                        (expired_ids,),
+                    )
+                    # 3. Delete user_quest mapping
+                    cur.execute(
+                        "DELETE FROM user_quest WHERE quest_id = ANY(%s)",
+                        (expired_ids,),
+                    )
+                    # 4. Delete quest rewards
+                    cur.execute(
+                        "DELETE FROM quest_reward WHERE quest_id = ANY(%s)",
+                        (expired_ids,),
+                    )
+                    # 5. Delete quest target species/categories
+                    cur.execute(
+                        "DELETE FROM target_dictionary WHERE quest_id = ANY(%s)",
+                        (expired_ids,),
+                    )
+                    cur.execute(
+                        "DELETE FROM target_dictionary_categories WHERE quest_id = ANY(%s)",
+                        (expired_ids,),
+                    )
+                    # 6. Delete quest itself
+                    cur.execute(
+                        "DELETE FROM quest WHERE id = ANY(%s)",
+                        (expired_ids,),
+                    )
+                    conn.commit()
+    except Exception as e:
+        st.warning(f"만료된 퀘스트 정리 중 오류가 발생했습니다: {e}")
 
