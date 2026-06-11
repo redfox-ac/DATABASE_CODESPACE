@@ -1,3 +1,5 @@
+from utils.vworld import get_administrative_district
+from utils.image import get_gps
 import io
 import time
 import uuid
@@ -5,6 +7,7 @@ import streamlit as st
 from google import genai
 from google.genai import errors
 from PIL import Image
+from PIL.ExifTags import TAGS
 from pydantic import BaseModel, Field
 
 from utils.auth import require_login
@@ -86,6 +89,23 @@ def collection_lens():
     )
     if uploaded is None:
         return
+    
+
+    pos = get_gps(uploaded)
+    if pos is None:
+        st.error("사진에서 위치 정보를 찾을 수 없습니다.")
+        return
+    
+    lat, lon = pos
+    address_data = get_administrative_district(lat, lon)
+    if address_data is None:
+        st.error("해당 위치에 대한 정보를 찾을 수 없습니다.")
+        return
+    if address_data:
+        st.warning(
+            f"⚠️ 보호 구역에서 촬영된 사진입니다. 사진이 도감에 반영되지 않습니다")
+        return
+
 
     with st.status("분석 중...", expanded=True) as status:
         try:
@@ -142,8 +162,7 @@ def collection_lens():
         
     if result.get("is_protected"):
         st.warning(
-            f"⚠️ **{species_name}** — 법정 보호종으로 확인되었습니다. "
-            "관찰 기록만 저장되며, 채집·포획은 금지됩니다. (+10 XP)"
+            f"⚠️ **{species_name}** — 법정 보호종으로 확인되었습니다. 관찰 기록만 저장되며, 채집·포획은 금지됩니다. (+10 XP)"
         )
     else:
         st.success(f"🎉 **{species_name}** 수집 완료! (+10 XP)")
