@@ -61,7 +61,7 @@ def authenticate_user(nickname: str) -> dict | None:
                 cur.execute(
                     """
                     INSERT INTO users (id, xp, trust_score)
-                    VALUES (%s, 0, 0)
+                    VALUES (%s, 0, 0.2)
                     RETURNING id, xp, trust_score, created_at
                     """,
                     (user_id,),
@@ -852,45 +852,10 @@ def cleanup_expired_quests() -> None:
     try:
         with psycopg.connect(_db_url()) as conn:
             with conn.cursor() as cur:
-                # 1. Get expired quest IDs
-                cur.execute("SELECT id FROM quest WHERE expire_at < NOW()")
-                expired_ids = [row[0] for row in cur.fetchall()]
-                
-                if expired_ids:
-                    # 2. Delete progress details first due to foreign key constraints (NO ACTION)
-                    cur.execute(
-                        "DELETE FROM quest_progress_dictionary WHERE quest_id = ANY(%s)",
-                        (expired_ids,),
-                    )
-                    cur.execute(
-                        "DELETE FROM quest_progress_dictionary_categories WHERE quest_id = ANY(%s)",
-                        (expired_ids,),
-                    )
-                    # 3. Delete user_quest mapping
-                    cur.execute(
-                        "DELETE FROM user_quest WHERE quest_id = ANY(%s)",
-                        (expired_ids,),
-                    )
-                    # 4. Delete quest rewards
-                    cur.execute(
-                        "DELETE FROM quest_reward WHERE quest_id = ANY(%s)",
-                        (expired_ids,),
-                    )
-                    # 5. Delete quest target species/categories
-                    cur.execute(
-                        "DELETE FROM target_dictionary WHERE quest_id = ANY(%s)",
-                        (expired_ids,),
-                    )
-                    cur.execute(
-                        "DELETE FROM target_dictionary_categories WHERE quest_id = ANY(%s)",
-                        (expired_ids,),
-                    )
-                    # 6. Delete quest itself
-                    cur.execute(
-                        "DELETE FROM quest WHERE id = ANY(%s)",
-                        (expired_ids,),
-                    )
-                    conn.commit()
+                # DB의 ON DELETE CASCADE 정책을 활용하여 단일 쿼리로 
+                # 만료된 퀘스트 및 연관된 모든 하위 참조 테이블 데이터를 자동 삭제합니다.
+                cur.execute("DELETE FROM quest WHERE expire_at < NOW()")
+                conn.commit()
     except Exception as e:
         st.warning(f"만료된 퀘스트 정리 중 오류가 발생했습니다: {e}")
 
@@ -976,7 +941,10 @@ def record_picture_trust(user_id, picture_id: int, selected_candidate_id: int, r
                     (user_id,),
                 )
                 conn.commit()
-                return True
+                
+        # Evaluate species confirmation conditions after recording
+        evaluate_and_confirm_picture(picture_id)
+        return True
     except Exception as e:
         print(f"Error recording picture trust: {e}")
         return False
@@ -1021,5 +989,246 @@ def check_user_daily_minigame_participation(user_id) -> bool:
                 return cur.fetchone() is not None
     except Exception as e:
         print(f"Error checking user daily minigame participation: {e}")
+        return False
+
+
+def calculate_binomial_p_value(n: int, k: int, p0: float = 0.25) -> float:
+    """이항 가설 검정의 p-value를 계산합니다 (귀무가설 하에서 k개 이상 얻을 확률)."""
+    import math
+    if n == 0:
+        return 1.0
+    p_val = 0.0
+    for x in range(k, n + 1):
+        p_val += math.comb(n, x) * (p0 ** x) * ((1.0 - p0) ** (n - x))
+    return p_val
+
+
+def calculate_bayesian_posterior(candidates: list[dict], votes: list[dict], user_trust_map: dict) -> dict[int, float]:
+    """
+    각 후보 생물종에 대해 베이지안 사후 확률을 업데이트합니다.
+    - candidates: [{"id": dictionary_id, "confidence_score": float}]
+    - votes: [{"user_id": UUID, "selected_candidate_id": int}]
+    - user_trust_map: {user_id: rho_value}
+    """
+    M = len(candidates)
+    if M == 0:
+        return {}
+
+    # 1. Prior 정규화 (AI 예측 Confidence 활용)
+    total_conf = sum(float(c["confidence_score"]) for c in candidates)
+    if total_conf == 0:
+        priors = {c["id"]: 1.0 / M for c in candidates}
+    else:
+        priors = {c["id"]: float(c["confidence_score"]) / total_conf for c in candidates}
+
+    # 2. Likelihood 곱 계산
+    likelihoods = {}
+    for cand in candidates:
+        s_k = cand["id"]
+        lh = 1.0
+        
+        for vote in votes:
+            u_id = vote["user_id"]
+            v_i = vote["selected_candidate_id"]
+            
+            # 유저의 상관계수 (기록이 없거나 초기 유저면 기본값 0.2)
+            rho_i = float(user_trust_map.get(u_id, 0.2))
+            
+            # 트롤 유저 방어: 상관계수가 음수(rho < 0.0)이면 가중치를 0.0으로 강제 고정하여 배제
+            if rho_i < 0.0:
+                rho_i = 0.0
+            
+            # 상관계수를 활용한 정답 확률 p_i 맵핑
+            p_i = max(0.0, 1.0 / M + (1.0 - 1.0 / M) * rho_i)
+            
+            # Likelihood
+            if v_i == s_k:
+                lh *= p_i
+            else:
+                lh *= (1.0 - p_i) / max(1, M - 1)
+                
+        likelihoods[s_k] = lh
+
+    # 3. Posterior 계산 (priors * likelihoods 정규화)
+    denominator = sum(priors[c["id"]] * likelihoods[c["id"]] for c in candidates)
+    if denominator == 0:
+        return priors
+
+    posteriors = {}
+    for cand in candidates:
+        s_k = cand["id"]
+        posteriors[s_k] = (priors[s_k] * likelihoods[s_k]) / denominator
+
+    return posteriors
+
+
+def evaluate_and_confirm_picture(picture_id: int) -> bool:
+    """
+    특정 사진의 AI 분석 후보군 및 사용자 투표 결과를 종합하여 생물종 확정 여부를 판단합니다.
+    최종 기준(또는 시간 경과 완화 기준)을 만족할 경우 확정(confirmed_dictionary_id 설정) 처리하고,
+    기여 유저 추가 보상 및 상관계수 평판을 적응형 감마로 갱신합니다.
+    """
+    import datetime
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # 1. 사진 정보 조회 (created_at 추가) 및 기확정 여부 확인
+                cur.execute(
+                    "SELECT id, confirmed_dictionary_id, candidate_dictionary_id, created_at FROM pictures WHERE id = %s",
+                    (picture_id,),
+                )
+                pic = cur.fetchone()
+                if not pic or pic["confirmed_dictionary_id"] is not None:
+                    return False
+                
+                # 2. AI 후보군 정보 조회
+                cur.execute(
+                    "SELECT dictionary_id AS id, confidence_score FROM picture_candidates WHERE picture_id = %s",
+                    (picture_id,),
+                )
+                candidates = [dict(row) for row in cur.fetchall()]
+                M = len(candidates)
+                if M == 0:
+                    return False
+                
+                # 3. 유효 사용자 투표 조회 (Spam 필터링 완화: 500ms ~ 300000ms)
+                cur.execute(
+                    """
+                    SELECT user_id, selected_candidate_id, response_time
+                    FROM picture_trust
+                    WHERE picture_id = %s
+                      AND response_time >= 500
+                      AND response_time <= 300000
+                    """,
+                    (picture_id,),
+                )
+                votes = [dict(row) for row in cur.fetchall()]
+                N = len(votes)
+                
+                if N == 0:
+                    return False
+                
+                # 4. 투표에 참여한 유저들의 상관계수 신뢰 점수(trust_score) 조회
+                user_ids = list(set(v["user_id"] for v in votes))
+                user_trust_map = {}
+                if user_ids:
+                    cur.execute(
+                        "SELECT id, trust_score FROM users WHERE id = ANY(%s)",
+                        (user_ids,),
+                    )
+                    for row in cur.fetchall():
+                        user_trust_map[row["id"]] = float(row["trust_score"] if row["trust_score"] is not None else 0.2)
+                
+                # 5. 베이지안 사후 확률 산출
+                posteriors = calculate_bayesian_posterior(candidates, votes, user_trust_map)
+                if not posteriors:
+                    return False
+                
+                # 사후 확률이 가장 높은 생물종 선정
+                best_candidate_id = max(posteriors, key=posteriors.get)
+                best_posterior = posteriors[best_candidate_id]
+                
+                # 6. 1위 후보의 실제 득표수 K 계산
+                K = sum(1 for v in votes if v["selected_candidate_id"] == best_candidate_id)
+                consensus_ratio = float(K) / N
+                
+                # 7. 이항 가설 검정 p-value 산출
+                p0 = 1.0 / M
+                p_value = calculate_binomial_p_value(N, K, p0)
+                
+                # --- [확정 임계치 판단] ---
+                is_confirmed = False
+                
+                # 안전망 확인용: 1위 후보의 AI 신뢰도 점수 조회
+                ai_conf = 0.0
+                for cand in candidates:
+                    if cand["id"] == best_candidate_id:
+                        ai_conf = float(cand["confidence_score"])
+                        break
+                
+                # 취약점 A: 콜드 스타트 시간 경과 완화 (7일 이상 경과, N >= 1, 만장일치 C = 1.0, AI 예측 1위이며 AI 신뢰도 >= 0.8)
+                pic_created = pic["created_at"]
+                if pic_created:
+                    # offset-naive vs offset-aware datetime 비교 일치를 위해 timezone 보정
+                    if pic_created.tzinfo is None:
+                        time_elapsed = datetime.datetime.now() - pic_created
+                    else:
+                        time_elapsed = datetime.datetime.now(datetime.timezone.utc) - pic_created
+                    is_timeout = time_elapsed.days >= 7
+                else:
+                    is_timeout = False
+                
+                if is_timeout and N >= 1 and consensus_ratio == 1.0 and best_candidate_id == pic["candidate_dictionary_id"] and ai_conf >= 0.8:
+                    is_confirmed = True
+                    print(f"[SPECIES CONFIRMED via TIMEOUT] Picture {picture_id} -> Dictionary {best_candidate_id}")
+                else:
+                    # 취약점 B: 다수결 횡포 방어용 AI Confidence 기반 안전망
+                    if ai_conf < 0.1:
+                        # AI 신뢰도가 매우 낮은 종에 투표가 몰린 경우 규칙 강화: N >= 5, p-value < 0.01, 사후확률 >= 0.95
+                        if N >= 5 and p_value < 0.01 and best_posterior >= 0.95:
+                            is_confirmed = True
+                    else:
+                        # 일반 조건: N >= 3, p-value < 0.05, 사후확률 >= 0.95
+                        if N >= 3 and p_value < 0.05 and best_posterior >= 0.95:
+                            is_confirmed = True
+                
+                # 기준 미충족 시 확정 보류
+                if not is_confirmed:
+                    return False
+                
+                # --- [확정 및 사후 처리 실행] ---
+                print(f"[SPECIES CONFIRMED] Picture {picture_id} -> Dictionary {best_candidate_id} (Posterior: {best_posterior:.4f}, p-value: {p_value:.4f})")
+                
+                # 1) 도감 등록 상태 업데이트
+                cur.execute(
+                    "UPDATE pictures SET confirmed_dictionary_id = %s WHERE id = %s",
+                    (best_candidate_id, picture_id),
+                )
+                
+                # 2) 참여자 상관계수 신뢰도 및 경험치 추가 보상 업데이트
+                for vote in votes:
+                    u_id = vote["user_id"]
+                    v_i = vote["selected_candidate_id"]
+                    
+                    rho_old = float(user_trust_map.get(u_id, 0.2))
+                    
+                    # 적응형 감마 계산: 유저의 과거 유효 투표 횟수 n_u 조회
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) FROM picture_trust
+                        WHERE user_id = %s
+                          AND response_time >= 500
+                          AND response_time <= 300000
+                        """,
+                        (u_id,),
+                    )
+                    n_u = cur.fetchone()["count"]
+                    
+                    gamma = max(0.1, 0.5 * (0.85 ** n_u))
+                    
+                    if v_i == best_candidate_id:
+                        # 정답 투표한 검증자: 상관계수 상향 (+1.0 방향) 및 추가 경험치 보상
+                        r_current = 1.0
+                        cur.execute(
+                            "UPDATE users SET xp = xp + 20 WHERE id = %s",
+                            (u_id,),
+                        )
+                    else:
+                        # 오답 투표한 검증자: 상관계수 하향 (감점 완화 적용)
+                        r_current = -consensus_ratio / (M - 1)
+                        
+                    # 상관계수 EMA 업데이트 및 [-1.0, 1.0] 클리핑
+                    rho_new = (1.0 - gamma) * rho_old + gamma * r_current
+                    rho_new = max(-1.0, min(1.0, rho_new))
+                    
+                    cur.execute(
+                        "UPDATE users SET trust_score = %s WHERE id = %s",
+                        (rho_new, u_id),
+                    )
+                
+                conn.commit()
+                return True
+    except Exception as e:
+        print(f"Error evaluating and confirming picture {picture_id}: {e}")
         return False
 

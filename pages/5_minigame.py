@@ -27,6 +27,11 @@ if len(dictionary) < 4:
 
 user = st.session_state.user_info
 
+# Check bad actor/restricted policy (rho_u <= -0.2)
+if user.get("trust_score") is not None and float(user["trust_score"]) <= -0.2:
+    st.error("⚠️ 지속적인 오답 제출로 인해 24시간 동안 미니게임 검증 참여가 제한되었습니다.")
+    st.stop()
+
 # Check today's participation
 if check_user_daily_minigame_participation(user["id"]):
     if "minigame_feedback" in st.session_state:

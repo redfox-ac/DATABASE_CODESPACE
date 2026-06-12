@@ -1,3 +1,4 @@
+import random
 from utils.vworld import get_administrative_district
 from utils.image import get_gps
 import io
@@ -157,8 +158,21 @@ def collection_lens():
             primary_candidate = matched_candidates[0]
             species_name = primary_candidate["name"]
             
-            candidate_ids = [c["id"] for c in matched_candidates][:4]
-            confidence_scores = [c["confidence_score"] for c in matched_candidates][:4]
+            # 이항 검정(M지선다)이 정상 작동하려면 후보 수가 최소 2개 이상(권장 4개)이어야 합니다.
+            # 만약 매칭된 후보가 4개 미만인 경우 도감에서 무작위 오답 후보군을 채워 4개 후보를 보장합니다.
+            candidate_ids = [c["id"] for c in matched_candidates]
+            confidence_scores = [c["confidence_score"] for c in matched_candidates]
+            
+            if len(candidate_ids) < 4:
+                others = [d for d in dict_list if d["id"] not in candidate_ids]
+                needed = 4 - len(candidate_ids)
+                wrong = random.sample(others, min(needed, len(others)))
+                for w in wrong:
+                    candidate_ids.append(w["id"])
+                    confidence_scores.append(0.01)
+                    
+            candidate_ids = candidate_ids[:4]
+            confidence_scores = confidence_scores[:4]
             
             status.update(label="이미지 업로드 중...")
             file_name = f"{user['id']}_{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"

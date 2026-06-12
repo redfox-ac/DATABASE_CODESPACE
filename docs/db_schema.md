@@ -55,12 +55,12 @@
 
 - **Users**: 사용자 데이터
 
-| **필드명**    | **설명**                                  |
-| ------------- | ----------------------------------------- |
-| `id`          | 유저 고유 ID (Supabase Auth 연동 UUID)    |
-| `xp`          | 유저의 누적 경험치 (레벨 산출용)          |
-| `trust_score` | 미니게임 응답에 따라 변동되는 신뢰도 점수 |
-| `created_at`  | 계정 생성 일시                            |
+| **필드명**    | **설명**                                                      |
+| ------------- | ------------------------------------------------------------- |
+| `id`          | 유저 고유 ID (Supabase Auth 연동 UUID)                        |
+| `xp`          | 유저의 누적 경험치 (레벨 산출용)                              |
+| `trust_score` | 미니게임 응답에 따라 변동되는 신뢰도 상관계수 (기본값: `0.2`) |
+| `created_at`  | 계정 생성 일시                                                |
 
 - **UserInventory**: 사용자별 가지는 아이템 데이터
 
@@ -148,12 +148,13 @@
 | **필드명**                | **설명**                                                              |
 | ------------------------- | --------------------------------------------------------------------- |
 | `id`                      | 사진 고유 번호                                                        |
-| `user_id`                 | 사진을 업로드한 유저 ID                                               |
+| `user_id`                 | 사진을 업로드한 유저 ID (삭제 시 연쇄 삭제)                           |
 | `storage_url`             | Supabase Storage 이미지 경로                                          |
 | `latitude`                | 촬영 위도                                                             |
 | `longitude`               | 촬영 경도                                                             |
-| `candidate_dictionary_id` | AI가 1차로 추정한 생물 도감 고유 번호 (도감에 매칭된 1순위 대표 후보) |
-| `confirmed_dictionary_id` | 미니게임 다수결을 통해 최종 확정된 생물종 ID                          |
+| `candidate_dictionary_id` | AI가 1차로 추정한 생물 도감 고유 번호 (도감 삭제 시 SET NULL)         |
+| `confirmed_dictionary_id` | 미니게임 다수결을 통해 최종 확정된 생물종 ID (도감 삭제 시 SET NULL)  |
+| `created_at`              | 사진 업로드 일시 (시간 경과 완화 판정용)                              |
 
 - **PictureCandidates**: 사진 후보 생물종 목록
 
@@ -192,7 +193,7 @@ CREATE TABLE dictionary (
     name VARCHAR(100) NOT NULL,
     description TEXT,
     is_protected BOOLEAN DEFAULT FALSE,
-    category_id INT REFERENCES dictionary_categories(id)
+    category_id INT REFERENCES dictionary_categories(id) ON DELETE SET NULL
 );
 
 CREATE TABLE items_category (
@@ -204,42 +205,42 @@ CREATE TABLE items_category (
 CREATE TABLE items (
     id SERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
-    category_id INT REFERENCES items_category(id)
+    category_id INT REFERENCES items_category(id) ON DELETE SET NULL
 );
 
 CREATE TABLE terrarium_slot (
     id SERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
     description TEXT,
-    category_id INT REFERENCES items_category(id)
+    category_id INT REFERENCES items_category(id) ON DELETE SET NULL
 );
 
 -- 2. User & Inventory 도메인
 CREATE TABLE users (
     id UUID PRIMARY KEY,
     xp INT DEFAULT 0,
-    trust_score INT DEFAULT 0,
+    trust_score NUMERIC DEFAULT 0.2, -- 상관계수 기반 신뢰도 (기본값: 0.2)
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 CREATE TABLE user_inventory (
     id SERIAL PRIMARY KEY,
-    user_id UUID REFERENCES users(id),
-    item_id INT REFERENCES items(id),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    item_id INT REFERENCES items(id) ON DELETE CASCADE,
     quantity INT DEFAULT 1,
     acquired_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE (user_id, item_id)
 );
 
 CREATE TABLE user_terrarium (
-    user_id UUID REFERENCES users(id),
-    item_id INT REFERENCES items(id),
-    slot_id INT REFERENCES terrarium_slot(id),
+    user_id UUID,
+    item_id INT,
+    slot_id INT REFERENCES terrarium_slot(id) ON DELETE CASCADE,
     PRIMARY KEY (user_id, slot_id),
-    FOREIGN KEY (user_id, item_id) REFERENCES user_inventory(user_id, item_id)
+    FOREIGN KEY (user_id, item_id) REFERENCES user_inventory(user_id, item_id) ON DELETE CASCADE
 );
 
--- 3. Quest 도메인 (다중 목표 추적 반영)
+-- 3. Quest 도메인
 CREATE TABLE quest (
     id SERIAL PRIMARY KEY,
     description TEXT NOT NULL,
@@ -248,29 +249,29 @@ CREATE TABLE quest (
 );
 
 CREATE TABLE quest_reward (
-    quest_id INT REFERENCES quest(id),
-    item_id INT REFERENCES items(id),
+    quest_id INT REFERENCES quest(id) ON DELETE CASCADE,
+    item_id INT REFERENCES items(id) ON DELETE CASCADE,
     amount INT DEFAULT 0,
     PRIMARY KEY (quest_id, item_id)
 );
 
 CREATE TABLE target_dictionary (
-    quest_id INT REFERENCES quest(id),
-    dictionary_id INT REFERENCES dictionary(id),
+    quest_id INT REFERENCES quest(id) ON DELETE CASCADE,
+    dictionary_id INT REFERENCES dictionary(id) ON DELETE CASCADE,
     target_count INT DEFAULT 1,
     PRIMARY KEY (quest_id, dictionary_id)
 );
 
 CREATE TABLE target_dictionary_categories (
-    quest_id INT REFERENCES quest(id),
-    category_id INT REFERENCES dictionary_categories(id),
+    quest_id INT REFERENCES quest(id) ON DELETE CASCADE,
+    category_id INT REFERENCES dictionary_categories(id) ON DELETE CASCADE,
     target_count INT DEFAULT 1,
     PRIMARY KEY (quest_id, category_id)
 );
 
 CREATE TABLE user_quest (
-    user_id UUID REFERENCES users(id),
-    quest_id INT REFERENCES quest(id),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    quest_id INT REFERENCES quest(id) ON DELETE CASCADE,
     status VARCHAR(20) DEFAULT 'in_progress',
     PRIMARY KEY (user_id, quest_id)
 );
@@ -278,43 +279,44 @@ CREATE TABLE user_quest (
 CREATE TABLE quest_progress_dictionary (
     user_id UUID,
     quest_id INT,
-    dictionary_id INT REFERENCES dictionary(id),
+    dictionary_id INT REFERENCES dictionary(id) ON DELETE CASCADE,
     current_count INT DEFAULT 0,
     PRIMARY KEY (user_id, quest_id, dictionary_id),
-    FOREIGN KEY (user_id, quest_id) REFERENCES user_quest(user_id, quest_id)
+    FOREIGN KEY (user_id, quest_id) REFERENCES user_quest(user_id, quest_id) ON DELETE CASCADE
 );
 
 CREATE TABLE quest_progress_dictionary_categories (
     user_id UUID,
     quest_id INT,
-    category_id INT REFERENCES dictionary_categories(id),
+    category_id INT REFERENCES dictionary_categories(id) ON DELETE CASCADE,
     current_count INT DEFAULT 0,
     PRIMARY KEY (user_id, quest_id, category_id),
-    FOREIGN KEY (user_id, quest_id) REFERENCES user_quest(user_id, quest_id)
+    FOREIGN KEY (user_id, quest_id) REFERENCES user_quest(user_id, quest_id) ON DELETE CASCADE
 );
 
 -- 4. Image & Trust 도메인
 CREATE TABLE pictures (
     id SERIAL PRIMARY KEY,
-    user_id UUID REFERENCES users(id),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     storage_url TEXT NOT NULL,
     latitude DOUBLE PRECISION,
     longitude DOUBLE PRECISION,
-    candidate_dictionary_id INT REFERENCES dictionary(id),
-    confirmed_dictionary_id INT REFERENCES dictionary(id)
+    candidate_dictionary_id INT REFERENCES dictionary(id) ON DELETE SET NULL,
+    confirmed_dictionary_id INT REFERENCES dictionary(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 CREATE TABLE picture_candidates (
     picture_id INT REFERENCES pictures(id) ON DELETE CASCADE,
-    dictionary_id INT REFERENCES dictionary(id),
+    dictionary_id INT REFERENCES dictionary(id) ON DELETE CASCADE,
     confidence_score DOUBLE PRECISION,
     PRIMARY KEY (picture_id, dictionary_id)
 );
 
 CREATE TABLE picture_trust (
-    user_id UUID REFERENCES users(id),
-    picture_id INT REFERENCES pictures(id),
-    selected_candidate_id INT REFERENCES dictionary(id),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    picture_id INT REFERENCES pictures(id) ON DELETE CASCADE,
+    selected_candidate_id INT REFERENCES dictionary(id) ON DELETE SET NULL,
     response_time INT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     PRIMARY KEY (user_id, picture_id)
