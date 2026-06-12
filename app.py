@@ -18,7 +18,6 @@ if st.session_state.logged_in and st.session_state.user_info:
         - **도감**: 수집한 생물 카드
         - **퀘스트**: 일일·연구 퀘스트 보드
         - **테라리움**: 나만의 생태 환경
-        - **미니게임**: 데이터 신뢰성 검증 (캡차)
         """
     )
 else:

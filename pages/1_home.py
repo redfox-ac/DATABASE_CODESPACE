@@ -63,9 +63,14 @@ def compress_image(uploaded_file, max_size_bytes=2 * 1024 * 1024) -> io.BytesIO:
     return output
 
 
-class ImageAnalysisResult(BaseModel):
+class SpeciesCandidate(BaseModel):
     name: str = Field(description="동물의 한국어 생물종 이름")
     confidence_score: float = Field(description="이 분석 결과에 대한 AI의 확신 점수 (0.0-1.0 사이)")
+
+class ImageAnalysisResult(BaseModel):
+    candidates: list[SpeciesCandidate] = Field(
+        description="분석 결과로 추정되는 생물종 후보 목록. 이미지의 생물이 확실하더라도 추후 검증을 위해 반드시 유사종이나 가능성이 있는 후보종들을 포함하여 최소 2개, 최대 4개까지 신뢰도가 높은 순으로 제공해야 합니다."
+    )
 
 
 if "GEMINI_API_KEY" in st.secrets:
@@ -113,32 +118,59 @@ def collection_lens():
             compressed_io = compress_image(uploaded)
             compressed_bytes = compressed_io.getvalue()
             
-            status.update(label="AI 분석 중...")
+            status.update(label="사진 분석 중...")
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
                 # pyrefly: ignore [bad-argument-type]
-                contents=[Image.open(io.BytesIO(compressed_bytes)), "이 이미지를 정밀하게 분석해서 지정된 형식의 JSON 데이터로 출력해줘."],
+                contents=[
+                    Image.open(io.BytesIO(compressed_bytes)), 
+                    "이 이미지를 정밀하게 분석해서 지정된 형식의 JSON 데이터로 출력해줘. 이미지가 아주 확실하더라도, 나중의 검증을 위해 형태적으로 가장 유사하거나 가능성이 있는 구체적인 한국어 생물종 후보를 포함하여 **최대 4개**의 후보 목록(candidates)을 항상 채워서 반환해줘. 포괄적인 분류명(예: 벌, 도마뱀)보다는 구체적인 한국어 국명(예: 쌍살벌, 장수도마뱀)을 우선적으로 사용해줘."
+                ],
                 config=config,
             )
             # pyrefly: ignore [missing-attribute]
-            species_name = response.parsed.name.strip()
-            
-            dict_list = fetch_all_dictionary()
-            matched_entry = next((item for item in dict_list if item["name"].strip() == species_name), None)
-            
-            if matched_entry is None:
+            candidates = response.parsed.candidates if response.parsed else []
+            if not candidates:
                 status.update(label="분석 실패", state="error")
-                st.error(f"❌ '{species_name}'은(는) 에코퀘스트의 생물 목록에 등록되어 있지 않습니다.")
+                st.error("❌ 이미지에서 식별된 생물종 후보가 없습니다.")
                 return
-                
-            dictionary_id = matched_entry["id"]
+
+            dict_list = fetch_all_dictionary()
+            matched_candidates = []
+            for cand in candidates:
+                matched = next((item for item in dict_list if item["name"].strip() == cand.name.strip()), None)
+                if matched:
+                    matched_candidates.append({
+                        "id": matched["id"],
+                        "name": matched["name"],
+                        "confidence_score": cand.confidence_score,
+                        "is_protected": matched["is_protected"]
+                    })
+
+            if not matched_candidates:
+                status.update(label="분석 실패", state="error")
+                st.error(f"❌ 분석된 생물종 후보들({[c.name for c in candidates]})이 에코퀘스트의 생물 목록에 등록되어 있지 않습니다.")
+                return
+
+            # 신뢰도 내림차순 정렬
+            matched_candidates.sort(key=lambda x: x["confidence_score"], reverse=True)
+            primary_candidate = matched_candidates[0]
+            species_name = primary_candidate["name"]
+            
+            candidate_ids = [c["id"] for c in matched_candidates][:4]
+            confidence_scores = [c["confidence_score"] for c in matched_candidates][:4]
             
             status.update(label="이미지 업로드 중...")
             file_name = f"{user['id']}_{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"
             public_url = upload_picture_to_supabase(compressed_bytes, file_name)
             
             status.update(label="데이터 저장 중...")
-            result = insert_discovery_transaction(user["id"], dictionary_id, public_url)
+            result = insert_discovery_transaction(
+                user_id=user["id"],
+                candidate_ids=candidate_ids,
+                storage_url=public_url,
+                confidence_scores=confidence_scores
+            )
             
             if result is None:
                 status.update(label="저장 실패", state="error")
@@ -167,6 +199,10 @@ def collection_lens():
     else:
         st.success(f"🎉 **{species_name}** 수집 완료! (+10 XP)")
 
+    st.markdown("##### 🤖 AI가 분석한 생물종 후보 목록:")
+    for mc in matched_candidates:
+        st.markdown(f"- **{mc['name']}** (신뢰도: {mc['confidence_score'] * 100:.1f}%)")
+
     updated = fetch_user(user["id"], nickname=user.get("nickname", ""))
     if updated:
         st.session_state.user_info = updated
@@ -175,12 +211,10 @@ def collection_lens():
 
 st.title("🏠 대시보드")
 
-col_a, col_b, col_c = st.columns(3)
+col_a, col_b = st.columns(2)
 with col_a:
     st.metric("닉네임", user["nickname"])
 with col_b:
-    st.metric("신뢰도", f"{user.get('trust_score', 0)} pt")
-with col_c:
     xp = user.get("xp", 0)
     max_xp = user.get("max_xp", 200) or 200
     st.metric("경험치", f"{xp} / {max_xp}")
@@ -190,7 +224,7 @@ st.progress(progress, text=f"레벨 진행도 {int(progress * 100)}%")
 
 st.divider()
 st.subheader("생물 수집")
-st.caption("사진을 업로드하면 AI 렌즈가 생물을 분석해 도감에 등록합니다. (데모: 랜덤 종 선택)")
+st.caption("사진을 업로드하면 사진 속 생물을 분석해 도감에 등록합니다.")
 
 if st.button("📸 생물 수집 렌즈 열기", type="primary"):
     collection_lens()

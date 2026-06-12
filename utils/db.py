@@ -187,7 +187,18 @@ def fetch_all_dictionary() -> list[dict]:
         return []
 
 
-def insert_discovery_transaction(user_id, dictionary_id: int, storage_url: str = _DEMO_STORAGE_URL) -> dict | None:
+def insert_discovery_transaction(
+    user_id,
+    candidate_ids: list[int],
+    storage_url: str = _DEMO_STORAGE_URL,
+    confidence_scores: list[float] | None = None
+) -> dict | None:
+    if not candidate_ids:
+        return None
+
+    primary_dictionary_id = candidate_ids[0]
+    scores = confidence_scores or [1.0] * len(candidate_ids)
+
     try:
         with psycopg.connect(_db_url()) as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -196,7 +207,7 @@ def insert_discovery_transaction(user_id, dictionary_id: int, storage_url: str =
                     SELECT 1 FROM pictures
                     WHERE user_id = %s AND candidate_dictionary_id = %s
                     """,
-                    (user_id, dictionary_id),
+                    (user_id, primary_dictionary_id),
                 )
                 if cur.fetchone():
                     return {"duplicate": True}
@@ -205,14 +216,27 @@ def insert_discovery_transaction(user_id, dictionary_id: int, storage_url: str =
                     """
                     INSERT INTO pictures (user_id, storage_url, candidate_dictionary_id)
                     VALUES (%s, %s, %s)
+                    RETURNING id
                     """,
-                    (user_id, storage_url, dictionary_id),
+                    (user_id, storage_url, primary_dictionary_id),
                 )
+                # pyrefly: ignore [unsupported-operation]
+                picture_id = cur.fetchone()["id"]
+
+                for cand_id, score in zip(candidate_ids, scores):
+                    cur.execute(
+                        """
+                        INSERT INTO picture_candidates (picture_id, dictionary_id, confidence_score)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (picture_id, dictionary_id) DO NOTHING
+                        """,
+                        (picture_id, cand_id, score),
+                    )
 
                 # Get category_id of this dictionary entry
                 cur.execute(
                     "SELECT category_id FROM dictionary WHERE id = %s",
-                    (dictionary_id,),
+                    (primary_dictionary_id,),
                 )
                 dict_entry = cur.fetchone()
                 category_id = dict_entry["category_id"] if dict_entry else None
@@ -228,7 +252,7 @@ def insert_discovery_transaction(user_id, dictionary_id: int, storage_url: str =
                           SELECT quest_id FROM user_quest WHERE user_id = %s AND status = 'in_progress'
                       )
                     """,
-                    (user_id, dictionary_id, user_id),
+                    (user_id, primary_dictionary_id, user_id),
                 )
 
                 # Update category progress
@@ -298,7 +322,7 @@ def insert_discovery_transaction(user_id, dictionary_id: int, storage_url: str =
                     FROM dictionary
                     WHERE id = %s
                     """,
-                    (dictionary_id,),
+                    (primary_dictionary_id,),
                 )
                 entry = cur.fetchone()
                 conn.commit()
@@ -869,4 +893,133 @@ def cleanup_expired_quests() -> None:
                     conn.commit()
     except Exception as e:
         st.warning(f"만료된 퀘스트 정리 중 오류가 발생했습니다: {e}")
+
+
+def fetch_random_picture_for_minigame(user_id) -> dict | None:
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT id, storage_url, candidate_dictionary_id
+                    FROM pictures
+                    WHERE user_id != %s
+                      AND id NOT IN (
+                          SELECT picture_id FROM picture_trust WHERE user_id = %s
+                      )
+                    ORDER BY RANDOM()
+                    LIMIT 1
+                    """,
+                    (user_id, user_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+
+                pic = dict(row)
+
+                # Fetch candidates
+                cur.execute(
+                    """
+                    SELECT pc.dictionary_id AS id, d.name
+                    FROM picture_candidates pc
+                    JOIN dictionary d ON d.id = pc.dictionary_id
+                    WHERE pc.picture_id = %s
+                    """,
+                    (pic["id"],),
+                )
+                pic["candidates"] = [dict(r) for r in cur.fetchall()]
+
+                # Fetch primary candidate name
+                cur.execute(
+                    "SELECT name FROM dictionary WHERE id = %s",
+                    (pic["candidate_dictionary_id"],),
+                )
+                prim = cur.fetchone()
+                pic["primary_name"] = prim["name"] if prim else "알 수 없음"
+
+                # Sign URL
+                path = pic["storage_url"]
+                if path and not path.startswith("http") and not path.startswith("demo://"):
+                    try:
+                        url = st.secrets["SUPABASE_URL"]
+                        key = st.secrets["SUPABASE_KEY"]
+                        client = create_client(url, key)
+                        signed_res = client.storage.from_("picture").create_signed_url(path, expires_in=604800)
+                        pic["storage_url"] = signed_res["signedURL"]
+                    except Exception as e:
+                        print(f"Error signing URL in minigame: {e}")
+
+                return pic
+    except Exception as e:
+        print(f"Error fetching random picture for minigame: {e}")
+        return None
+
+
+def record_picture_trust(user_id, picture_id: int, selected_candidate_id: int, response_time: int) -> bool:
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO picture_trust (user_id, picture_id, selected_candidate_id, response_time)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id, picture_id)
+                    DO UPDATE SET selected_candidate_id = EXCLUDED.selected_candidate_id,
+                                  response_time = EXCLUDED.response_time
+                    """,
+                    (user_id, picture_id, selected_candidate_id, response_time),
+                )
+                # Award 10 XP directly upon minigame response completion
+                cur.execute(
+                    "UPDATE users SET xp = xp + 10 WHERE id = %s",
+                    (user_id,),
+                )
+                conn.commit()
+                return True
+    except Exception as e:
+        print(f"Error recording picture trust: {e}")
+        return False
+
+
+def check_picture_valid_for_minigame(user_id, picture_id: int) -> bool:
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM pictures
+                    WHERE id = %s
+                      AND user_id != %s
+                      AND id NOT IN (
+                          SELECT picture_id FROM picture_trust WHERE user_id = %s
+                      )
+                    """,
+                    (picture_id, user_id, user_id),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        print(f"Error checking picture validity for minigame: {e}")
+        return False
+
+
+def check_user_daily_minigame_participation(user_id) -> bool:
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM picture_trust
+                    WHERE user_id = %s
+                      AND created_at::date = (NOW() AT TIME ZONE 'Asia/Seoul')::date
+                    LIMIT 1
+                    """,
+                    (user_id,),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        print(f"Error checking user daily minigame participation: {e}")
+        return False
 
