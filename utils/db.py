@@ -315,6 +315,36 @@ def insert_discovery_transaction(
                     (user_id,),
                 )
 
+                # 발견 성공 시 해당 생물종 이름의 동물(category_id: 3) 아이템 지급 연동
+                cur.execute("SELECT name FROM dictionary WHERE id = %s", (primary_dictionary_id,))
+                species_row = cur.fetchone()
+                if species_row:
+                    species_name = species_row["name"].strip()
+                    
+                    # items 테이블에 존재하는지 확인
+                    cur.execute("SELECT id FROM items WHERE name = %s AND category_id = 3", (species_name,))
+                    item_row = cur.fetchone()
+                    if item_row:
+                        item_id = item_row["id"]
+                    else:
+                        cur.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM items")
+                        item_id = cur.fetchone()["next_id"]
+                        cur.execute(
+                            "INSERT INTO items (id, name, category_id) VALUES (%s, %s, 3)",
+                            (item_id, species_name)
+                        )
+                    
+                    # 유저 인벤토리에 추가/수량 증가
+                    cur.execute(
+                        """
+                        INSERT INTO user_inventory (user_id, item_id, quantity)
+                        VALUES (%s, %s, 1)
+                        ON CONFLICT (user_id, item_id)
+                        DO UPDATE SET quantity = user_inventory.quantity + 1
+                        """,
+                        (user_id, item_id)
+                    )
+
                 cur.execute(
                     """
                     SELECT id, name, description, is_protected, category_id,
