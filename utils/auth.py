@@ -240,7 +240,7 @@ def render_sidebar_nav() -> None:
         st.page_link("app.py", label="홈", icon="🏠")
         st.page_link("pages/2_dictionary.py", label="도감", icon="📖")
         st.page_link("pages/3_quest.py", label="퀘스트", icon="🎯")
-        st.page_link("pages/4_terrarium.py", label="테라리움", icon="🪴")
+        st.page_link("pages/4_inventory.py", label="인벤토리", icon="🎒")
         st.divider()
         if st.button("로그아웃", use_container_width=True):
             st.session_state.logged_in = False

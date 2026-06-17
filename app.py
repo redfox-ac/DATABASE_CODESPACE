@@ -109,11 +109,23 @@ if st.session_state.logged_in and st.session_state.user_info:
             
             if equipped:
                 border_style = "solid"
-                border_color = "var(--primary-color)"
-                box_shadow = "0 0 12px rgba(46, 204, 113, 0.15), inset 0 0 8px rgba(255, 255, 255, 0.05)"
-                hover_shadow = "0 6px 20px rgba(46, 204, 113, 0.25)"
-                tag_bg = "var(--primary-color)"
-                tag_color = "var(--background-color)"
+                slot_name = slot.get("slot_name")
+                if slot_name == "식물":
+                    border_color = "#2ecc71"
+                    box_shadow = "0 0 12px rgba(46, 204, 113, 0.15), inset 0 0 8px rgba(255, 255, 255, 0.05)"
+                    hover_shadow = "0 6px 20px rgba(46, 204, 113, 0.25)"
+                    tag_bg = "#2ecc71"
+                elif slot_name == "동물":
+                    border_color = "#3498db"
+                    box_shadow = "0 0 12px rgba(52, 152, 219, 0.15), inset 0 0 8px rgba(255, 255, 255, 0.05)"
+                    hover_shadow = "0 6px 20px rgba(52, 152, 219, 0.25)"
+                    tag_bg = "#3498db"
+                else:  # 배경
+                    border_color = "#9b59b6"
+                    box_shadow = "0 0 12px rgba(155, 89, 182, 0.15), inset 0 0 8px rgba(255, 255, 255, 0.05)"
+                    hover_shadow = "0 6px 20px rgba(155, 89, 182, 0.25)"
+                    tag_bg = "#9b59b6"
+                tag_color = "white"
             else:
                 border_style = "dashed"
                 border_color = "rgba(255, 255, 255, 0.12)"
@@ -267,7 +279,15 @@ if st.session_state.logged_in and st.session_state.user_info:
                         icon = "🐾"
                         
                     label = equipped if equipped else "비어 있음"
-                    label_color = "var(--primary-color)" if equipped else "rgba(255, 255, 255, 0.3)"
+                    if equipped:
+                        if slot_name == "식물":
+                            label_color = "#2ecc71"
+                        elif slot_name == "동물":
+                            label_color = "#3498db"
+                        else:
+                            label_color = "#9b59b6"
+                    else:
+                        label_color = "rgba(255, 255, 255, 0.3)"
                     
                     with col:
                         if st.button(icon, key=f"slot_btn_{slot['slot_id']}"):
