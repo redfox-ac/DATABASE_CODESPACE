@@ -1281,3 +1281,174 @@ def evaluate_and_confirm_picture(picture_id: int) -> bool:
         print(f"Error evaluating and confirming picture {picture_id}: {e}")
         return False
 
+
+def fetch_research_data(
+    confirmed_only: bool = False,
+    category: str | None = None,
+    protected_only: bool = False,
+    start_date=None,
+    end_date=None,
+) -> list[dict]:
+    import datetime
+    db_url = _db_url()
+    
+    query_base = """
+        SELECT 
+            p.id AS observation_id,
+            p.user_id AS uploader_id,
+            COALESCE(p.confirmed_dictionary_id, p.candidate_dictionary_id) AS matched_dictionary_id,
+            p.confirmed_dictionary_id IS NOT NULL AS is_confirmed,
+            p.latitude,
+            p.longitude,
+            p.created_at AS observed_at,
+            d.name AS species_name,
+            d.is_protected AS is_protected,
+            dc.name AS category_name
+        FROM pictures p
+        JOIN dictionary d ON d.id = COALESCE(p.confirmed_dictionary_id, p.candidate_dictionary_id)
+        LEFT JOIN dictionary_categories dc ON dc.id = d.category_id
+        WHERE p.latitude IS NOT NULL 
+          AND p.longitude IS NOT NULL
+    """
+    
+    conditions = []
+    params = []
+    
+    if confirmed_only:
+        conditions.append("p.confirmed_dictionary_id IS NOT NULL")
+        
+    if protected_only:
+        conditions.append("d.is_protected = TRUE")
+        
+    if category:
+        conditions.append("dc.name = %s")
+        params.append(category)
+        
+    if start_date:
+        if isinstance(start_date, str):
+            start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+        elif isinstance(start_date, datetime.datetime):
+            start_dt = start_date
+        else:
+            start_dt = datetime.datetime.combine(start_date, datetime.time.min)
+        conditions.append("p.created_at >= %s")
+        params.append(start_dt)
+        
+    if end_date:
+        if isinstance(end_date, str):
+            end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d") + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+        elif isinstance(end_date, datetime.datetime):
+            end_dt = end_date
+        else:
+            end_dt = datetime.datetime.combine(end_date, datetime.time.max)
+        conditions.append("p.created_at <= %s")
+        params.append(end_dt)
+        
+    if conditions:
+        query_base += " AND " + " AND ".join(conditions)
+        
+    query_base += " ORDER BY p.id ASC"
+    
+    exported_data = []
+    try:
+        with psycopg.connect(db_url) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(query_base, params)
+                records = cur.fetchall()
+                
+                for row in records:
+                    pic_id = row["observation_id"]
+                    matched_dict_id = row["matched_dictionary_id"]
+                    
+                    cur.execute(
+                        "SELECT dictionary_id AS id, confidence_score FROM picture_candidates WHERE picture_id = %s",
+                        (pic_id,)
+                    )
+                    candidates_rows = cur.fetchall()
+                    
+                    cur.execute(
+                        """
+                        SELECT t.user_id, t.selected_candidate_id, t.response_time, COALESCE(u.trust_score, 0.2) AS trust_score
+                        FROM picture_trust t
+                        JOIN users u ON t.user_id = u.id
+                        WHERE t.picture_id = %s
+                          AND t.response_time >= 500
+                          AND t.response_time <= 300000
+                        """,
+                        (pic_id,)
+                    )
+                    votes_rows = cur.fetchall()
+                    
+                    candidates = [{"id": r["id"], "confidence_score": float(r["confidence_score"])} for r in candidates_rows]
+                    votes = [{"user_id": r["user_id"], "selected_candidate_id": r["selected_candidate_id"]} for r in votes_rows]
+                    user_trust_map = {r["user_id"]: float(r["trust_score"]) for r in votes_rows}
+                    
+                    n = len(votes)
+                    k = sum(1 for v in votes if v["selected_candidate_id"] == matched_dict_id)
+                    M = len(candidates)
+                    p0 = 1.0 / M if M > 0 else 0.25
+                    
+                    if M == 0:
+                        confidence = 0.0
+                        p_val = 1.0
+                    else:
+                        posteriors = calculate_bayesian_posterior(candidates, votes, user_trust_map)
+                        if n == 0:
+                            confidence = next((float(c["confidence_score"]) for c in candidates if c["id"] == matched_dict_id), 0.0)
+                            p_val = 1.0
+                        else:
+                            confidence = posteriors.get(matched_dict_id, 0.0)
+                            p_val = calculate_binomial_p_value(n, k, p0)
+                            
+                    observed_str = ""
+                    if row["observed_at"]:
+                        observed_str = row["observed_at"].strftime("%Y-%m-%d %H:%M:%S")
+                        
+                    exported_data.append({
+                        "observation_id": pic_id,
+                        "species_name": row["species_name"],
+                        "category_name": row["category_name"] or "미분류",
+                        "is_protected": row["is_protected"],
+                        "latitude": row["latitude"],
+                        "longitude": row["longitude"],
+                        "is_confirmed": row["is_confirmed"],
+                        "confidence": round(confidence, 4),
+                        "p_value": round(p_val, 4),
+                        "vote_count": n,
+                        "observed_at": observed_str
+                    })
+    except Exception as e:
+        print(f"Error fetching research data: {e}")
+    return exported_data
+
+
+def fetch_admin_statistics() -> dict:
+    db_url = _db_url()
+    stats = {
+        "total_users": 0,
+        "total_pictures": 0,
+        "confirmed_pictures": 0,
+        "pending_pictures": 0,
+        "restricted_users": 0
+    }
+    try:
+        with psycopg.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users")
+                stats["total_users"] = cur.fetchone()[0]
+                
+                cur.execute("SELECT COUNT(*) FROM pictures")
+                stats["total_pictures"] = cur.fetchone()[0]
+                
+                cur.execute("SELECT COUNT(*) FROM pictures WHERE confirmed_dictionary_id IS NOT NULL")
+                stats["confirmed_pictures"] = cur.fetchone()[0]
+                
+                stats["pending_pictures"] = stats["total_pictures"] - stats["confirmed_pictures"]
+                
+                cur.execute("SELECT COUNT(*) FROM users WHERE trust_score <= -0.2")
+                stats["restricted_users"] = cur.fetchone()[0]
+    except Exception as e:
+        print(f"Error fetching admin statistics: {e}")
+    return stats
+
+

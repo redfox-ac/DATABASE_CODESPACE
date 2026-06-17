@@ -328,3 +328,6 @@ else:
                          st.session_state.logged_in = True
                          st.session_state.user_info = user
                          st.rerun()
+
+        st.markdown("<div style='text-align: center; margin-top: 15px;'></div>", unsafe_allow_html=True)
+        st.page_link("pages/6_admin.py", label="🔬 연구자인가요? 다음 페이지에서 생물 데이터 신청하기", use_container_width=True)
