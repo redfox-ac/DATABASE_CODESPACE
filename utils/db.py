@@ -242,7 +242,9 @@ def insert_discovery_transaction(
     user_id,
     candidate_ids: list[int],
     storage_url: str = _DEMO_STORAGE_URL,
-    confidence_scores: list[float] | None = None
+    confidence_scores: list[float] | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None
 ) -> dict | None:
     if not candidate_ids:
         return None
@@ -265,11 +267,11 @@ def insert_discovery_transaction(
 
                 cur.execute(
                     """
-                    INSERT INTO pictures (user_id, storage_url, candidate_dictionary_id)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO pictures (user_id, storage_url, candidate_dictionary_id, latitude, longitude)
+                    VALUES (%s, %s, %s, %s, %s)
                     RETURNING id
                     """,
-                    (user_id, storage_url, primary_dictionary_id),
+                    (user_id, storage_url, primary_dictionary_id, latitude, longitude),
                 )
                 # pyrefly: ignore [unsupported-operation]
                 picture_id = cur.fetchone()["id"]

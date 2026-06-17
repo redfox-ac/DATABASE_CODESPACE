@@ -164,7 +164,9 @@ def collection_lens():
                 user_id=user["id"],
                 candidate_ids=candidate_ids,
                 storage_url=public_url,
-                confidence_scores=confidence_scores
+                confidence_scores=confidence_scores,
+                latitude=lat,
+                longitude=lon
             )
             
             if result is None:
