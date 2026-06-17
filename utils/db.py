@@ -187,6 +187,57 @@ def fetch_all_dictionary() -> list[dict]:
         return []
 
 
+def check_and_update_quest_completion(cur, user_id):
+    """지정된 유저의 진행 중인 퀘스트 중 목표를 달성한 퀘스트 상태를 'completed'로 업데이트합니다."""
+    cur.execute(
+        """
+        SELECT uq.quest_id
+        FROM user_quest uq
+        WHERE uq.user_id = %s AND uq.status = 'in_progress'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM target_dictionary td
+              LEFT JOIN quest_progress_dictionary qpd
+                ON qpd.user_id = uq.user_id
+               AND qpd.quest_id = uq.quest_id
+               AND qpd.dictionary_id = td.dictionary_id
+              WHERE td.quest_id = uq.quest_id
+                AND COALESCE(qpd.current_count, 0) < td.target_count
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM target_dictionary_categories tdc
+              LEFT JOIN quest_progress_dictionary_categories qpdc
+                ON qpdc.user_id = uq.user_id
+               AND qpdc.quest_id = uq.quest_id
+               AND qpdc.category_id = tdc.category_id
+              WHERE tdc.quest_id = uq.quest_id
+                AND COALESCE(qpdc.current_count, 0) < tdc.target_count
+          )
+        """,
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    completed_quests = []
+    for r in rows:
+        if isinstance(r, dict):
+            completed_quests.append(r["quest_id"])
+        elif isinstance(r, (list, tuple)):
+            completed_quests.append(r[0])
+        else:
+            completed_quests.append(r)
+
+    for q_id in completed_quests:
+        cur.execute(
+            """
+            UPDATE user_quest
+            SET status = 'completed'
+            WHERE user_id = %s AND quest_id = %s
+            """,
+            (user_id, q_id),
+        )
+
+
 def insert_discovery_transaction(
     user_id,
     candidate_ids: list[int],
@@ -270,45 +321,7 @@ def insert_discovery_transaction(
                     )
 
                 # Check if any active quests are now completed
-                cur.execute(
-                    """
-                    SELECT uq.quest_id
-                    FROM user_quest uq
-                    WHERE uq.user_id = %s AND uq.status = 'in_progress'
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM target_dictionary td
-                          LEFT JOIN quest_progress_dictionary qpd
-                            ON qpd.user_id = uq.user_id
-                           AND qpd.quest_id = uq.quest_id
-                           AND qpd.dictionary_id = td.dictionary_id
-                          WHERE td.quest_id = uq.quest_id
-                            AND COALESCE(qpd.current_count, 0) < td.target_count
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM target_dictionary_categories tdc
-                          LEFT JOIN quest_progress_dictionary_categories qpdc
-                            ON qpdc.user_id = uq.user_id
-                           AND qpdc.quest_id = uq.quest_id
-                           AND qpdc.category_id = tdc.category_id
-                          WHERE tdc.quest_id = uq.quest_id
-                            AND COALESCE(qpdc.current_count, 0) < tdc.target_count
-                      )
-                    """,
-                    (user_id,),
-                )
-                completed_quests = [r["quest_id"] for r in cur.fetchall()]
-
-                for q_id in completed_quests:
-                    cur.execute(
-                        """
-                        UPDATE user_quest
-                        SET status = 'completed'
-                        WHERE user_id = %s AND quest_id = %s
-                        """,
-                        (user_id, q_id),
-                    )
+                check_and_update_quest_completion(cur, user_id)
 
                 cur.execute(
                     "UPDATE users SET xp = xp + 10 WHERE id = %s",
@@ -608,6 +621,9 @@ def accept_quest(user_id, quest_id: int) -> bool:
                     (user_id, quest_id, quest_id),
                 )
                 
+                # 4. Check if the newly accepted quest is already complete (e.g. has no objectives)
+                check_and_update_quest_completion(cur, user_id)
+                
                 conn.commit()
                 return True
     except Exception as e:
@@ -620,6 +636,9 @@ def fetch_user_quests(user_id) -> list[dict]:
     try:
         with psycopg.connect(_db_url()) as conn:
             with conn.cursor(row_factory=dict_row) as cur:
+                # 0. Check and update completed quests
+                check_and_update_quest_completion(cur, user_id)
+                
                 # Fetch user quests
                 cur.execute(
                     """
