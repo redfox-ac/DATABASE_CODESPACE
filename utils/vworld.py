@@ -8,11 +8,14 @@ def get_administrative_district(lat, lon):
         return None
     
     api_key = st.secrets["VWORLD_API_KEY"]
+    proxy_token = st.secrets["PROXY_TOKEN"]
     
-    # 1. API 엔드포인트 설정
-    url = "https://api.vworld.kr/req/data"
+    # 해외 IP 접속 불가능으로 인한 홈서버 프록시
+    # url = "https://api.vworld.kr/req/data"
+    url = "https://morae.parrot-luma.ts.net/proxy/vworld" 
 
-    # 2. 요청 파라미터 설정
+    service_domain = "https://github.com/redfox-ac/DATABASE_CODESPACE"
+    
     params = {
         "service": "data",
         "request": "GetFeature",
@@ -21,8 +24,9 @@ def get_administrative_district(lat, lon):
         "geomFilter": f"POINT({lon} {lat})",
         "attrFilter": "uname:like:야생동·식물보호구역",
         "crs": "EPSG:4326",
-        "domain": "https://github.com/redfox-ac/DATABASE_CODESPACE",
-        "size": "1"
+        "domain": service_domain,
+        "size": "1",
+        "token": proxy_token,
     }
     
     # 3. API 요청
