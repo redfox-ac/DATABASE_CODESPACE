@@ -117,17 +117,23 @@ for col, choice in zip(button_cols, st.session_state.captcha_choices):
                 response_time = 0
             
             # Record response to database
-            record_picture_trust(
+            success = record_picture_trust(
                 user_id=user["id"],
                 picture_id=st.session_state.captcha_picture_id,
                 selected_candidate_id=choice["id"],
                 response_time=response_time,
             )
             
-            st.session_state.minigame_feedback = (
-                "success",
-                "답변이 등록되었습니다. 추후 답변이 정답으로 판정될 시 보상이 지급됩니다."
-            )
+            if success:
+                st.session_state.minigame_feedback = (
+                    "success",
+                    "답변이 등록되었습니다. 추후 답변이 정답으로 판정될 시 보상이 지급됩니다."
+                )
+            else:
+                st.session_state.minigame_feedback = (
+                    "error",
+                    "답변 등록에 실패했습니다. 잠시 후 다시 시도해 주세요."
+                )
             st.session_state.captcha_choices = []
             st.rerun()
 

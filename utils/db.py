@@ -980,7 +980,7 @@ def record_picture_trust(user_id, picture_id: int, selected_candidate_id: int, r
                     """
                     INSERT INTO picture_trust (user_id, picture_id, selected_candidate_id, response_time)
                     VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (user_id, picture_id)
+                    ON CONFLICT (user_id, picture_id) WHERE user_id IS NOT NULL
                     DO UPDATE SET selected_candidate_id = EXCLUDED.selected_candidate_id,
                                   response_time = EXCLUDED.response_time
                     """,
