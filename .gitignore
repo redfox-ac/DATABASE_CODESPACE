@@ -1,0 +1,13 @@
+.streamlit/secrets.toml
+.env
+.env.*
+__pycache__/
+*.pyc
+.venv/
+lib/
+etc/
+bin
+pyvenv.cfg
+pyproject.toml
+.DS_Store
+**/.DS_Store
